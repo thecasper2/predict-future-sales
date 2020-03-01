@@ -1,0 +1,238 @@
+---
+title: "1 - Visualise Data"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(ggplot2)
+library(lubridate)
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+source("func/read_data.R")
+```
+
+# Introduction
+
+In this challenge we wish to predict the sales for November 2015 for each item
+that a shop sells.
+
+# Visualise
+
+This notebook purely aims to explore the data visually to help us understand
+the prediciton challenge.
+
+## Monthly sales
+
+Firstly we take a simple look at the actual volume of sales and revenue per
+month to understand the training data.
+
+```{r}
+options(scipen=8)
+# Group sales and revenue by date
+monthly_sales <- data$sales_train[, .(
+    sales = sum(item_cnt_day),
+    revenue = sum(net_revenue)
+), by=.(floor_date(date, "month"))]
+
+# Plot sales and revenue
+ggplot(melt(monthly_sales, id="floor_date"), aes(x=floor_date, y=value)) +
+    geom_bar(stat="identity") +
+    theme_bw() +
+    facet_wrap(~variable, scales="free") +
+    labs(x="Date (month)", y="", title="Sales & Revenue by Month")
+```
+
+Regarding the general trend, two points stand out:
+
+- Volume of sales is decreasing over time
+- Revenue is fairly stable
+
+Regarding seasonality, we observe:
+
+- A peak in December, probably associated with Christmas
+- A trough in Summer
+
+We will explore seasonality further in a later section
+
+## Prediction imbalance
+
+As the training data goes back to 2013, it is fair to assume that many items
+may no longer generate sales or may not even be on sale any more! To check this,
+we will look at the proportion of items that generated sales over an increasing
+time period in the past.
+
+```{r sales_by_lookback}
+# Group sales by month and item_id for the last 6 months
+monthly_item_sales <- data$sales_train[, .(
+    sales = sum(item_cnt_day)
+), by=.(floor_date(date, "month"), item_id, shop_id)]
+
+# Then we identify all date/item_id combinations to help impute values where
+# there were no sales
+unique_dates <- data.table(floor_date=unique(monthly_item_sales$floor_date))
+cartesian_item_dates <- unique_dates[, 
+    as.list(data$test[,c("shop_id", "item_id")]), floor_date
+]
+
+# Combine to create a complete data table of items and dates
+monthly_item_sales <- monthly_item_sales[
+    cartesian_item_dates, on=c("floor_date", "item_id", "shop_id")
+]
+
+# Set NA sales to 0
+monthly_item_sales[is.na(sales), sales := 0]
+
+# Do a reverse cumulative sum per item to see how many sales are made FROM this
+# date till the last date
+monthly_item_sales[
+    order(item_id, -floor_date),
+    remaining_sales := cumsum(ifelse(sales < 0, 0, sales)),
+    by=.(item_id)
+]
+monthly_item_sales[, has_sales := ifelse(remaining_sales == 0, 0, 1)]
+
+# Finally we group by date and count how many of the items actually generated
+# sales from this date to the end
+monthly_sales_proportion <- monthly_item_sales[floor_date >= ymd(20141001),
+    .(has_sales_proportion = sum(has_sales) * 100 / length(has_sales)),
+    by=.(floor_date)
+]
+
+# Plot results
+ggplot(monthly_sales_proportion, aes(x=floor_date, y=has_sales_proportion)) +
+    geom_bar(stat="identity") +
+    theme_bw() +
+    expand_limits(y=100) +
+    labs(
+        x="Date (month)",
+        y="Proportion of items (%)",
+        title="Proportion of items with sales between timepoint and Oct 2015"
+    )
+```
+
+Less than 60% of items had a sale within the previous year, and only about
+25% had a sale in the previous month. Therefore we may be able to simplify our
+problem by identifying items that are unlikely to generate any new sales, and
+simply predict 0 for these items.
+
+To know if an item is unlikely to generate further sales we should look at how
+many consecutive months of no sales imply no sales in the coming month.
+
+```{r consecutive_no_sales}
+# Identify the month the item last got sales
+monthly_item_sales[order(item_id, floor_date), `:=` (
+        first_sales = min(ifelse(sales==0, 100000000, floor_date)),
+        most_recent_sales = cummax(ifelse(sales == 0, 0, floor_date)),
+        next_sales = shift(sales, type="lead")
+    ),
+    by = .(item_id)
+]
+
+# Identify how long ago the last sales were in days
+monthly_item_sales[, `:=` (
+    most_recent_sales_diff = as.numeric(floor_date - most_recent_sales),
+    first_sales_diff = as.numeric(floor_date - first_sales)
+)]
+
+# Find items with on October 2014, which first started selling at least a year
+# ago
+dead_items <- monthly_item_sales[
+    floor_date == ymd(20141001) & first_sales_diff > 365
+]
+dead_items <- dead_items[,
+    .(n_items = .N, n_dead_items = sum(ifelse(next_sales==0, 1, 0))),
+    by=.(most_recent_sales_diff)
+]
+dead_items[
+    order(most_recent_sales_diff),
+    proportion_dead_items := cumsum(n_dead_items) / cumsum(n_items),
+    by = .()
+]
+
+# Plot data
+ggplot(dead_items, aes(x=most_recent_sales_diff, y=proportion_dead_items)) +
+    geom_point() +
+    theme_bw() +
+    labs(
+        x="Days since last sale",
+        y="% items with no sales in November 2014",
+        title="Items as of October 2014"
+    ) +
+    expand_limits(y=c(0,1))
+```
+
+It seems that for about half the items that hadn't had sales in the last 100
+days, no sales were generated in the month afterwards. This reaches a maximum
+of around 75% when looking back over 600 days.
+
+This means if we predict 0 sales in November for items that had no sales in the
+last 100 days, then we should expect to predict incorrectly for around half of
+these items.
+
+## Sales per shop
+
+It is likely to be difficult to predict item/shop sales directly as there are
+so many time series models to fit, and many timeseries will be quite volatile.
+
+It may be more appropriate to first model how many sales each shop will get,
+then split those sales amongst their items. To see how viable this is we will
+visualise the sales of each shop as time series.
+
+```{r shop_sales}
+# Sum sales per shop per month
+shop_sales <- data$sales_train[,
+    .(sales = sum(item_cnt_day)),
+    by = .(floor_date(date, "month"), shop_id)
+]
+
+# Identify total shop sales
+shop_sales[, total_sales := sum(sales), by=.(shop_id)]
+shop_sales[, top_shop_id := ifelse(total_sales > 120000, shop_id, "all other")]
+top_shop_sales <- shop_sales[,
+    .(sales = sum(sales)),
+    by = .(floor_date, top_shop_id)
+]
+
+# Plot
+ggplot(top_shop_sales, aes(x=floor_date, y=log(sales), col=as.factor(top_shop_id))) +
+    geom_line() +
+    theme_bw() +
+    expand_limits(y=0) +
+    labs(
+        title = "Sales per shop (log scale)",
+        x = "Date (month)",
+        y = "Sales (log)",
+        col = "Shop"
+    )
+```
+
+Encouragingly even one of the bigger shops hasn't had any recent sales. Let's
+see how recent the most recent sale was for each shop
+
+```{r most_recent_sale}
+# Find most recent sale
+most_recent_sale <- data$sales_train[,
+    .(most_recent_sale = max(floor_date(date, "month"))),
+    by = .(shop_id)
+]
+
+# Plot
+ggplot(most_recent_sale, aes(x=most_recent_sale)) +
+    geom_histogram() +
+    theme_bw() +
+    labs(
+        x = "Date (month)",
+        y = "Number of shops",
+        title = "Shops against most recent sale"
+    ) + 
+    scale_x_date(date_breaks = "months" , date_labels = "%b-%y") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Encouragingly a number of shops haven't had sales for over half a year, some
+with any for years. In these cases it would definitely be sensible to predict
+no sales for all items. Thus we have already reduced our prediction problem
+quite significantly.

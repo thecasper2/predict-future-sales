@@ -1,0 +1,46 @@
+---
+title: "3 - Predict Item Sales per Shop"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(bsts)
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(magrittr)
+library(zoo)
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+source("func/read_data.R")
+source("func/predict.R")
+
+shop_sales <- fread("predictions/shop_sales.csv")
+```
+
+# Introduction
+
+# Predict item sales per shop
+
+```{r recent_item_sales}
+item_sales <- data$sales_train[date >= ymd(20151001),
+    .(sales = sum(item_cnt_day)),
+    by = .(item_id)
+]
+
+submission <- data$test
+submission <- shop_sales[, c("shop_id", "nov_sales")][submission, on = "shop_id"]
+submission <- item_sales[submission, on = "item_id"]
+submission[is.na(sales), sales := 0]
+submission[, item_shop_proportion := sales / sum(sales), by = .(shop_id)]
+submission[, item_cnt_month := item_shop_proportion * nov_prediction]
+submission[item_cnt_month > 20, item_cnt_month := 20]
+submission <- submission[, c("ID", "item_cnt_month")]
+```
+
+```{r write_submission}
+fwrite(submission, file="predictions/submission.csv", sep = ",")
+```
+

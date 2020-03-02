@@ -1,0 +1,113 @@
+---
+title: "2 - Predict Shop Sales"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(bsts)
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(magrittr)
+library(zoo)
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+source("func/read_data.R")
+source("func/predict.R")
+```
+
+# Introduction
+
+# Predict
+
+```{r get_top_shop_data}
+# Get daily saies per shop
+shop_data <- data$sales_train[,
+    .(sales = sum(item_cnt_day)),
+    by = .(date, shop_id)
+]
+
+# Then we identify all date/shop_id combinations to help impute values where
+# there were no sales
+unique_dates <- data.table(date=unique(shop_data$date))
+cartesian_shop_dates <- unique_dates[, 
+    as.list(data$shops[, c("shop_id")]), date
+]
+shop_data <- shop_data[
+    cartesian_shop_dates, on=c("shop_id", "date")
+][order(shop_id, date)]
+shop_data[is.na(sales), sales := 0]
+
+# Get reverse cumulative shop sales
+cumulative_shop_data <- copy(shop_data)
+cumulative_shop_data[order(shop_id, -date),
+    cumulative_sales := cumsum(sales),
+    by = .(shop_id)
+]
+shop_predictions <- cumulative_shop_data[
+    date == ymd(20150831),
+    c("shop_id", "cumulative_sales")
+]
+shop_predictions[, nov_sales := ifelse(cumulative_sales <= 0, 0, NA)]
+
+# Identify total shop sales
+active_shop_data <- shop_data[
+    shop_id %in% shop_predictions[cumulative_sales > 0]$shop_id
+]
+```
+
+```{r predict_top_shop}
+# Set seed
+set.seed(1)
+
+shops <- unique(active_shop_data$shop_id)
+for(i in seq(length(shops))){
+    shop <- shops[i]
+    cat(paste0("Shop ID:", shop, ". ", i, " of ", length(shops), "\n"))
+    # Create timeseries data
+    target <- "sales"
+    cutoff_date <- 20151031
+    
+    top_shop <- active_shop_data[shop_id == shop]
+    model <- construct_timeseries(top_shop, target, cutoff_date = cutoff_date)
+    
+    # Create state specification
+    ss <- list()
+    ss <- AddLocalLinearTrend(
+        state.specification = ss,
+        y=model$ts_train[, target]
+    )
+    ss <- AddSeasonal(ss, model$ts_train[, target], nseasons = 7)
+    #ss <- AddMonthlyAnnualCycle(ss, model$ts_train[, target])
+    
+    # Set holidays
+    # holiday.list <- list(NamedHoliday("NewYearsDay"))
+    # ss <- AddRegressionHoliday(
+    #     ss, y=model$ts_train[, target], holiday.list = holiday.list
+    # )
+    
+    # Construct models and predictions
+    model <- attach_bsts_model(model, ss, niter = 1000, ping = 1000, horizon=30)
+    #print(calculate_error(model$data, "sales"))
+    
+    # Plot
+    # g <- ggplot(model$data[date > ymd(cutoff_date)-30], aes(x = date)) +
+    #     geom_line(aes(y = sales), col="black") +
+    #     geom_line(aes(y = p_mean), col="red") +
+    #     geom_ribbon(aes(ymin = p_lower, ymax = p_upper), fill="red", alpha=0.2) +
+    #     expand_limits(y=0)
+    # print(g)
+
+    # Update November prediction
+    nov_prediction <- sum(model$predictions$mean)
+    nov_prediction <- ifelse(nov_prediction < 0, 0, nov_prediction)
+    shop_predictions[shop_id == shop, nov_sales := nov_prediction]
+}
+```
+
+```{r write_predictions}
+fwrite(shop_predictions[], file = "predictions/shop_sales.csv", sep = ",")
+```
+
